@@ -39,8 +39,7 @@ class PolicyNet(nn.Module):
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        # 输出动作分布的“均值”（连续动作），这里用 tanh 限制到 [-1, 1]
-        return torch.tanh(self.out(x))
+        return torch.tanh(self.out(x))  # action mean in [-1, 1]
 
 
 class ValueNet(nn.Module):
@@ -62,7 +61,7 @@ class Memory:
         self.actions = []
         self.logprobs = []
         self.rewards = []
-        self.dones = []
+        self.dones = []   # ✅ 必须与 rewards 同长度
 
     def clear(self):
         self.states.clear()
@@ -87,41 +86,41 @@ class PPOAgent:
 
     @torch.no_grad()
     def select_action(self, state_np):
-        """
-        输入:
-            state_np: numpy 向量 [state_dim]
-        输出:
-            action_np: numpy 向量 [action_dim]
-            logprob: float
-        """
+        # policy_old(state) 输出 action mean（tanh 到 [-1,1]）
+        # 采样 Normal(mean, std=0.3)，并记录 logprob
         state = torch.tensor(state_np, dtype=torch.float32, device=DEVICE).unsqueeze(0)
         mean = self.policy_old(state)
-        # 简单高斯采样，固定 std
         std = 0.3
         dist = torch.distributions.Normal(mean, std)
         action = dist.sample()
         logprob = dist.log_prob(action).sum(dim=-1)
-
         return action.squeeze(0).cpu().numpy(), float(logprob.item())
 
     def update(self, memory: Memory):
         """
         使用 memory 里的 trajectory 做 PPO 更新
+        先做一个非常重要的鲁棒性修复：保证 dones 与 rewards 长度一致（避免 GAE 崩）
+        然后取 states/actions/old_logprobs/value，做 GAE advantages（后续继续看下去就是 PPO clip 更新）
         """
         if len(memory.states) == 0:
             return
+
+        rewards = memory.rewards
+        dones = memory.dones
+
+        # ✅ 关键兜底：确保 dones 与 rewards 同长度
+        if (dones is None) or (len(dones) != len(rewards)):
+            dones = [0.0 for _ in range(len(rewards))]
+            if len(dones) > 0:
+                dones[-1] = 1.0  # 终止一次 rollout
+            memory.dones = dones
 
         states = torch.tensor(np.array(memory.states), dtype=torch.float32, device=DEVICE)
         actions = torch.tensor(np.array(memory.actions), dtype=torch.float32, device=DEVICE)
         old_logprobs = torch.tensor(np.array(memory.logprobs), dtype=torch.float32, device=DEVICE)
 
-        # 计算 returns + advantage
-        rewards = memory.rewards
-        dones = memory.dones
-
         values = self.value(states).squeeze(-1).detach().cpu().numpy().tolist()
 
-        returns = []
         advantages = []
         gae = 0.0
         next_value = 0.0
@@ -140,7 +139,6 @@ class PPOAgent:
         advantages = torch.tensor(advantages, dtype=torch.float32, device=DEVICE)
         returns = torch.tensor(returns, dtype=torch.float32, device=DEVICE)
 
-        # ---- PPO 多轮更新 ----
         for _ in range(PPO_EPOCHS):
             mean = self.policy(states)
             std = 0.3
@@ -228,7 +226,6 @@ class DLSAEncoder(nn.Module):
             device_map="auto" if self.use_4bit else None,
         )
 
-        # 共享 task adapter (Ag)
         lora_cfg_shared = LoraConfig(
             r=self.lora_r,
             lora_alpha=self.lora_alpha,
@@ -237,9 +234,8 @@ class DLSAEncoder(nn.Module):
             bias="none",
             task_type="CAUSAL_LM",
         )
+        #
         self.model_shared = get_peft_model(base, lora_cfg_shared)
-
-        # domain adapters: dict(client_id -> lora model copy)
         self.domain_models = {}
 
     def _ensure_domain_adapter(self, client_id: int):
@@ -255,36 +251,26 @@ class DLSAEncoder(nn.Module):
             bias="none",
             task_type="CAUSAL_LM",
         )
-        # ✅ add_adapter：不会二次包装，显存/结构更干净
         self.model_shared.add_adapter(name, lora_cfg_private)
         return name
 
     def _get_backbone(self, model):
-        """
-        返回真正的 transformer backbone（不含 lm_head），避免 forward 计算 logits 导致 OOM。
-        兼容：原模型 / PEFT 包装模型
-        """
-        # 先拆 PEFT
         if hasattr(model, "get_base_model"):
             base = model.get_base_model()
         else:
             base = model
 
-        # 常见命名：ForCausalLM 里 backbone 在 .model
         if hasattr(base, "model"):
             return base.model
-        # 少数模型用 transformer / backbone
         if hasattr(base, "transformer"):
             return base.transformer
         if hasattr(base, "backbone"):
             return base.backbone
-
-        # 最后兜底：如果找不到，就返回 base（但这可能仍会算 logits）
         return base
 
     @torch.no_grad()
     def _encode_text(self, model, texts):
-        from config import LLM_BATCH  # 用你已有的 LLM_BATCH=8
+        from config import LLM_BATCH
 
         device = next(model.parameters()).device
         backbone = self._get_backbone(model)
@@ -311,7 +297,8 @@ class DLSAEncoder(nn.Module):
             )
 
             hs = out.hidden_states[-1] if (
-                        hasattr(out, "hidden_states") and out.hidden_states is not None) else out.last_hidden_state
+                hasattr(out, "hidden_states") and out.hidden_states is not None
+            ) else out.last_hidden_state
 
             if self.pooling == "mean":
                 mask = enc["attention_mask"].unsqueeze(-1).float()
@@ -325,26 +312,18 @@ class DLSAEncoder(nn.Module):
         return torch.cat(outs, dim=0)
 
     def forward(self, texts_view1, texts_view2, client_id: int = 0, align_lambda: float = 0.0):
-        """
-        返回：
-        - z: 拼接后的语义表示 [B, 2H]
-        - loss_align: 对齐损失（view1 与 view2 的余弦距离）
-        """
-        # shared (Ag) 用于 view1；domain (As_i) 用于 view2
         m = self.model_shared
 
-        # ✅ 先处理：不对齐就只跑 view1，一次就返回（最大提速点）
         if not (align_lambda and align_lambda > 0):
             try:
                 m.set_adapter("default")
             except Exception:
                 pass
             z1 = self._encode_text(m, texts_view1)
-            z = torch.cat([z1, z1], dim=-1)  # 维度保持 2H
+            z = torch.cat([z1, z1], dim=-1)
             loss_align = torch.tensor(0.0, device=z.device)
             return z, loss_align
 
-        # 需要对齐：view1(task) + view2(domain)
         try:
             m.set_adapter("default")
         except Exception:
