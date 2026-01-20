@@ -6,6 +6,7 @@
 - 联邦训练 + 服务器进化
 - 每轮聚合后：在 test 上评估 AUC / F1 / AP
 """
+
 import time
 from datetime import datetime
 
@@ -17,13 +18,17 @@ from dataset_loader import load_default_dataset, train_test_split_global, split_
 from client import Client, DLSABasedModel  # 直接复用同一个模型定义
 from server import Server
 from sklearn.metrics import roc_auc_score, f1_score, average_precision_score
+
 from config import (
     NUM_CLIENTS, GLOBAL_ROUNDS, LOCAL_EPOCHS,
-    BATCH_SIZE, DEVICE, TEST_RATIO, USE_LLM_DLSA
+    DEVICE, TEST_RATIO, USE_LLM_DLSA,
+    USE_PROTO_ALIGN
 )
+
+
 def ts():
-    # 形如: 2026-01-04 15:23:11
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def fmt_sec(s: float) -> str:
     s = float(s)
@@ -32,7 +37,6 @@ def fmt_sec(s: float) -> str:
     if s < 3600:
         return f"{s/60:.1f}min"
     return f"{s/3600:.2f}h"
-
 
 
 def evaluate_global_on_test(global_params, X_test, y_test, amt_test, dlsa_encoder=None):
@@ -92,6 +96,7 @@ def main():
     print(f"[数据] X={X.shape}, y={y.shape}, amt={amt.shape}")
 
     # 2) 全局 train/test
+    # ✅ 关键修复：train_test_split_global 返回的是 (train_tuple, test_tuple)，不是 6 个值 :contentReference[oaicite:1]{index=1}
     (X_tr, y_tr, amt_tr), (X_te, y_te, amt_te) = train_test_split_global(
         X, y, amt,
         test_ratio=TEST_RATIO,
@@ -130,7 +135,9 @@ def main():
         print(f"\n[{ts()}] ===== Global Round {rnd} =====")
 
         # (1) 分配策略（single/ensemble）
-        server.dispatch_strategies_to_clients()
+        # 你原版 server.py 里是 dispatch_strategies_to_clients() :contentReference[oaicite:2]{index=2}
+        if hasattr(server, "dispatch_strategies_to_clients"):
+            server.dispatch_strategies_to_clients()
 
         # (2) 下发全局模型
         server.broadcast()
@@ -139,7 +146,7 @@ def main():
         round_stats = []
         for c in clients:
             t_c = time.time()
-            print(f"[{ts()}] [Client {c.client_id}] Local update...")
+            print(f"[{ts()}] [Client {c.client_id}] Local update.")
 
             stat = c.local_update(local_epochs=LOCAL_EPOCHS)
 
@@ -151,6 +158,12 @@ def main():
         t_ag = time.time()
         print(f"[{ts()}] [Server] aggregate start...")
         server.aggregate()
+
+        # ✅ 可选：Prototype Alignment（只有当你已按我给的 server.py/client.py 加了这两个方法时才会生效）
+        if USE_PROTO_ALIGN and hasattr(server, "aggregate_prototypes") and hasattr(server, "broadcast_prototypes"):
+            server.aggregate_prototypes(round_stats)
+            server.broadcast_prototypes()
+
         print(f"[{ts()}] [Server] aggregate done. time={fmt_sec(time.time() - t_ag)}")
 
         # (5) 打印本轮统计
@@ -158,24 +171,19 @@ def main():
         avg_fpr = float(np.mean([s["avg_fpr"] for s in round_stats]))
         avg_cost = float(np.mean([s["avg_cost"] for s in round_stats]))
         avg_reward = float(np.mean([s["avg_reward"] for s in round_stats]))
+        print(f"[{ts()}] [Round {rnd}] mean EFL={avg_efl:.6f} | mean FPR={avg_fpr:.6f} | mean COST={avg_cost:.6f} | mean REWARD={avg_reward:.6f}")
 
-        print(f"[Round {rnd}] mean EFL   = {avg_efl:.6f}")
-        print(f"    mean FPR   = {avg_fpr:.6f}")
-        print(f"    mean COST  = {avg_cost:.6f}")
-        print(f"    mean REWARD= {avg_reward:.6f}")
-
-        # (6) 测试集评估（全局模型）
-        t_eval = time.time()
-        print(f"[{ts()}] [Round {rnd}] TEST start...")
+        # (6) 测试评估
         auc, f1, ap = evaluate_global_on_test(server.global_params, X_te, y_te, amt_te, dlsa_encoder=dlsa_encoder)
-        print(f"[{ts()}] [Round {rnd}] TEST done. time={fmt_sec(time.time() - t_eval)}")
-        print(f"[{ts()}] [Round {rnd}] TEST(Global) metrics: AUC={auc:.6f}, F1={f1:.6f}, AP={ap:.6f}")
-        # (7) 进化层更新
-        server.evolve_strategies(rnd, round_stats)
-        print(f"[{ts()}] [Round {rnd}] round done. time={fmt_sec(time.time() - t_round)}")
+        print(f"[{ts()}] [Test] AUC={auc:.4f} | F1={f1:.4f} | AP={ap:.4f}")
 
-    print("\n训练结束。")
-    print(f"[{ts()}] Training finished. total_time={fmt_sec(time.time() - t_all)}")
+        # (7) 进化
+        if hasattr(server, "evolve_strategies"):
+            server.evolve_strategies(round_stats, round_idx=rnd)
+
+        print(f"[{ts()}] Round time={fmt_sec(time.time() - t_round)}")
+
+    print(f"[{ts()}] Training finished. total={fmt_sec(time.time() - t_all)}")
 
 
 if __name__ == "__main__":
